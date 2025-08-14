@@ -1,0 +1,378 @@
+-- Doom-like Game for RadioMaster Pocket (Bug-Fixed Version)
+-- Controls: Right gimbal for movement, Left gimbal roll for view rotation, SE trigger for shooting
+
+local game = nil
+
+local function init()
+    game = {
+        player = {
+            x = 64,
+            y = 64,
+            angle = 0,
+            health = 100
+        },
+        
+        screen = {
+            width = 128,
+            height = 64,
+            half_height = 32
+        },
+        
+        map = {
+            {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1},
+            {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+            {1,0,1,1,0,0,0,1,1,0,0,1,1,0,0,1},
+            {1,0,1,0,0,0,0,0,0,0,0,0,1,0,0,1},
+            {1,0,0,0,0,1,1,0,0,1,1,0,0,0,0,1},
+            {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1},
+            {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+            {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1}
+        },
+        
+        enemies = {
+            {x = 96, y = 96, health = 50, active = true},
+            {x = 160, y = 128, health = 50, active = true},
+            {x = 192, y = 96, health = 50, active = true}
+        },
+        
+        bullets = {},
+        score = 0,
+        ammo = 50,
+        lastTime = 0,
+        lastShoot = false,
+        initialized = false
+    }
+end
+
+local function safeGetValue(source)
+    local status, result = pcall(getValue, source)
+    if status and result then
+        return result
+    end
+    return 0
+end
+
+local function safeGetSwitchValue(switchName)
+    local status, index = pcall(getSwitchIndex, switchName)
+    if status and index then
+        local status2, value = pcall(getSwitchValue, index)
+        if status2 then
+            return value
+        end
+    end
+    return false
+end
+
+local function getControls()
+    local rightX = safeGetValue("ail")
+    local rightY = safeGetValue("ele") 
+    local leftRoll = safeGetValue("rud")
+    local seTrigger = safeGetSwitchValue("SE")
+    
+    -- Clamp values to prevent overflow
+    rightX = math.max(-1024, math.min(1024, rightX))
+    rightY = math.max(-1024, math.min(1024, rightY))
+    leftRoll = math.max(-1024, math.min(1024, leftRoll))
+    
+    return {
+        moveX = rightX / 1024,
+        moveY = rightY / 1024,
+        rotate = leftRoll / 1024,
+        shoot = seTrigger
+    }
+end
+
+local function isValidMapPosition(x, y)
+    local mapX = math.floor(x / 16) + 1
+    local mapY = math.floor(y / 16) + 1
+    
+    if mapX < 1 or mapX > 16 or mapY < 1 or mapY > 8 then
+        return false
+    end
+    
+    if not game.map[mapY] or not game.map[mapY][mapX] then
+        return false
+    end
+    
+    return game.map[mapY][mapX] == 0
+end
+
+local function updatePlayer(controls, dt)
+    if not game or not game.player then return end
+    
+    local player = game.player
+    local speed = 50 * dt
+    local rotSpeed = 2 * dt
+    
+    -- Normalize angle to prevent overflow
+    player.angle = player.angle + (controls.rotate * rotSpeed)
+    while player.angle > math.pi do 
+        player.angle = player.angle - 2 * math.pi 
+    end
+    while player.angle < -math.pi do 
+        player.angle = player.angle + 2 * math.pi 
+    end
+    
+    local cos_a = math.cos(player.angle)
+    local sin_a = math.sin(player.angle)
+    
+    local moveForward = -controls.moveY * speed
+    local moveStrafe = controls.moveX * speed
+    
+    local newX = player.x + cos_a * moveForward + (-sin_a) * moveStrafe
+    local newY = player.y + sin_a * moveForward + cos_a * moveStrafe
+    
+    -- Better collision detection with margin
+    local margin = 8
+    if isValidMapPosition(newX + margin, player.y + margin) and 
+       isValidMapPosition(newX - margin, player.y + margin) and
+       isValidMapPosition(newX + margin, player.y - margin) and 
+       isValidMapPosition(newX - margin, player.y - margin) then
+        player.x = newX
+    end
+    
+    if isValidMapPosition(player.x + margin, newY + margin) and 
+       isValidMapPosition(player.x - margin, newY + margin) and
+       isValidMapPosition(player.x + margin, newY - margin) and 
+       isValidMapPosition(player.x - margin, newY - margin) then
+        player.y = newY
+    end
+    
+    -- Keep player in bounds
+    player.x = math.max(16, math.min(240, player.x))
+    player.y = math.max(16, math.min(112, player.y))
+end
+
+local function updateBullets(dt)
+    if not game or not game.bullets then return end
+    
+    for i = #game.bullets, 1, -1 do
+        local bullet = game.bullets[i]
+        if not bullet then
+            table.remove(game.bullets, i)
+        else
+            bullet.x = bullet.x + (bullet.vx or 0) * dt
+            bullet.y = bullet.y + (bullet.vy or 0) * dt
+            bullet.life = (bullet.life or 0) - dt
+            
+            local hitWall = not isValidMapPosition(bullet.x, bullet.y)
+            
+            if bullet.life <= 0 or hitWall then
+                table.remove(game.bullets, i)
+            else
+                -- Check enemy collision
+                for j, enemy in ipairs(game.enemies) do
+                    if enemy and enemy.active then
+                        local dx = bullet.x - enemy.x
+                        local dy = bullet.y - enemy.y
+                        if dx*dx + dy*dy < 256 then
+                            enemy.health = enemy.health - 25
+                            if enemy.health <= 0 then
+                                enemy.active = false
+                                game.score = game.score + 100
+                            end
+                            table.remove(game.bullets, i)
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function shoot()
+    if not game or game.ammo <= 0 then return end
+    
+    local player = game.player
+    local speed = 200
+    
+    -- Limit bullet count to prevent memory issues
+    if #game.bullets >= 10 then
+        table.remove(game.bullets, 1)
+    end
+    
+    table.insert(game.bullets, {
+        x = player.x,
+        y = player.y,
+        vx = math.cos(player.angle) * speed,
+        vy = math.sin(player.angle) * speed,
+        life = 2.0
+    })
+    
+    game.ammo = game.ammo - 1
+end
+
+local function castRay(rayAngle, maxDistance)
+    if not game or not game.player then return maxDistance end
+    
+    local player = game.player
+    local stepSize = 1
+    local distance = 0
+    
+    local cos_a = math.cos(rayAngle)
+    local sin_a = math.sin(rayAngle)
+    
+    while distance < maxDistance do
+        local x = player.x + cos_a * distance
+        local y = player.y + sin_a * distance
+        
+        if not isValidMapPosition(x, y) then
+            return math.max(1, distance) -- Prevent division by zero
+        end
+        
+        distance = distance + stepSize
+    end
+    
+    return maxDistance
+end
+
+local function safeLcdDraw(func, ...)
+    local status, result = pcall(func, ...)
+    return status
+end
+
+local function render()
+    if not game or not game.player then return end
+    
+    safeLcdDraw(lcd.clear)
+    
+    local player = game.player
+    local screen = game.screen
+    local fov = math.pi / 3
+    local maxDistance = 200
+    
+    -- Render walls with error checking
+    for x = 0, screen.width - 1, 2 do -- Step by 2 for performance
+        local rayAngle = player.angle + (x - screen.width/2) * fov / screen.width
+        local distance = castRay(rayAngle, maxDistance)
+        
+        if distance > 0 then
+            local wallHeight = math.min((screen.height * 16) / distance, screen.height)
+            local wallTop = math.max(0, (screen.height - wallHeight) / 2)
+            local wallBottom = math.min(screen.height, wallTop + wallHeight)
+            
+            if wallHeight > 1 then
+                safeLcdDraw(lcd.drawLine, x, wallTop, x, wallBottom, SOLID, 0)
+            end
+        end
+    end
+    
+    -- Draw enemies with bounds checking
+    if game.enemies then
+        for _, enemy in ipairs(game.enemies) do
+            if enemy and enemy.active then
+                local dx = enemy.x - player.x
+                local dy = enemy.y - player.y
+                local distance = math.sqrt(dx*dx + dy*dy)
+                
+                if distance > 1 and distance < 150 then
+                    local angle = math.atan2(dy, dx) - player.angle
+                    
+                    while angle > math.pi do angle = angle - 2*math.pi end
+                    while angle < -math.pi do angle = angle + 2*math.pi end
+                    
+                    if math.abs(angle) < fov/2 then
+                        local screenX = screen.width/2 + (angle * screen.width / fov)
+                        local size = math.max(2, math.min(16, 400 / distance))
+                        
+                        screenX = math.max(0, math.min(screen.width - size, screenX - size/2))
+                        local screenY = math.max(0, math.min(screen.height - size, screen.height/2 - size/2))
+                        
+                        safeLcdDraw(lcd.drawFilledRectangle, screenX, screenY, size, size, SOLID)
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Draw bullets
+    if game.bullets then
+        for _, bullet in ipairs(game.bullets) do
+            if bullet then
+                local dx = bullet.x - player.x
+                local dy = bullet.y - player.y
+                local distance = math.sqrt(dx*dx + dy*dy)
+                
+                if distance > 1 and distance < 100 then
+                    local angle = math.atan2(dy, dx) - player.angle
+                    while angle > math.pi do angle = angle - 2*math.pi end
+                    while angle < -math.pi do angle = angle + 2*math.pi end
+                    
+                    if math.abs(angle) < fov/2 then
+                        local screenX = screen.width/2 + (angle * screen.width / fov)
+                        if screenX >= 0 and screenX < screen.width then
+                            safeLcdDraw(lcd.drawPoint, screenX, screen.height/2)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Draw HUD with safe string concatenation
+    local hp = tostring(game.player.health or 0)
+    local ammo = tostring(game.ammo or 0)
+    local score = tostring(game.score or 0)
+    
+    safeLcdDraw(lcd.drawText, 1, 1, "HP:" .. hp, SMLSIZE)
+    safeLcdDraw(lcd.drawText, 1, 10, "AMMO:" .. ammo, SMLSIZE)
+    safeLcdDraw(lcd.drawText, 1, 19, "SCORE:" .. score, SMLSIZE)
+    safeLcdDraw(lcd.drawText, 1, 55, "EXIT: Press EXIT", SMLSIZE)
+    
+    -- Draw crosshair
+    local centerX = screen.width / 2
+    local centerY = screen.height / 2
+    safeLcdDraw(lcd.drawLine, centerX - 2, centerY, centerX + 2, centerY, SOLID, 0)
+    safeLcdDraw(lcd.drawLine, centerX, centerY - 2, centerX, centerY + 2, SOLID, 0)
+end
+
+local function run(event)
+    -- Safe initialization
+    if game == nil then
+        init()
+        if game then
+            game.lastTime = getTime() / 100
+            game.initialized = true
+        end
+        return 0
+    end
+    
+    if not game.initialized then
+        return 2 -- Exit if initialization failed
+    end
+    
+    -- Handle exit
+    if event == EVT_EXIT_BREAK then
+        game = nil -- Clean up
+        return 2
+    end
+    
+    local currentTime = getTime() / 100
+    local dt = math.min(0.1, math.max(0, currentTime - game.lastTime))
+    game.lastTime = currentTime
+    
+    -- Skip frame if dt is too small or too large
+    if dt < 0.001 then
+        return 0
+    end
+    
+    local controls = getControls()
+    
+    -- Handle shooting with debounce
+    if controls.shoot and not game.lastShoot then
+        shoot()
+    end
+    game.lastShoot = controls.shoot
+    
+    -- Update game state
+    updatePlayer(controls, dt)
+    updateBullets(dt)
+    
+    -- Render
+    render()
+    
+    return 0
+end
+
+return { run=run }
